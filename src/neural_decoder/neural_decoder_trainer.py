@@ -83,12 +83,27 @@ def trainModel(args):
         bidirectional=args["bidirectional"],
     ).to(device)
 
+    # model = TCNDecoder(
+    #     neural_dim=args["nInputFeatures"],
+    #     n_classes=args["nClasses"],
+    #     hidden_dim=args["nUnits"],
+    #     layer_dim=args["nLayers"],
+    #     maxTimeSeriesLen=args["maxTimeSeriesLen"],
+    #     nDays=len(loadedData["train"]),
+    #     dropout=args["dropout"],
+    #     device=device,
+    #     strideLen=args["strideLen"],
+    #     kernelLen=args["kernelLen"],
+    #     gaussianSmoothWidth=args["gaussianSmoothWidth"],
+    #     bidirectional=args["bidirectional"],
+    # ).to(device)
+
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW( # exp. 2: Adam --> AdamW
         model.parameters(),
         lr=args["lrStart"],
         betas=(0.9, 0.999),
-        eps=0.1,
+        eps=0.1, # exp. 2: 0.1 --> 1e-8
         weight_decay=args["l2_decay"],
     )
     scheduler = torch.optim.lr_scheduler.LinearLR(
