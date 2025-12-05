@@ -1,9 +1,46 @@
 import torch
 from torch import nn
-
 from .augmentations import GaussianSmoothing
 
 
+# -------------------------------------------------------
+# Minimal TCN Residual Block (light, safe for GPU)
+# -------------------------------------------------------
+class TemporalBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=5, dilation=1, dropout=0.0):
+        super().__init__()
+
+        padding = (kernel_size - 1) * dilation // 2
+
+        self.conv1 = nn.Conv1d(
+            in_ch, out_ch, kernel_size,
+            padding=padding, dilation=dilation
+        )
+        self.conv2 = nn.Conv1d(
+            out_ch, out_ch, kernel_size,
+            padding=padding, dilation=dilation
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
+
+        self.residual = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        out = self.conv2(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        return out + self.residual(x)
+
+
+# -------------------------------------------------------
+# GRU + TCN Hybrid Decoder
+# -------------------------------------------------------
 class GRUDecoder(nn.Module):
     def __init__(
         self,
@@ -15,13 +52,12 @@ class GRUDecoder(nn.Module):
         dropout=0,
         device="cuda",
         strideLen=4,
-        kernelLen=14,
+        kernelLen=32,
         gaussianSmoothWidth=0,
         bidirectional=False,
     ):
         super(GRUDecoder, self).__init__()
 
-        # Defining the number of layers and the nodes in each layer
         self.layer_dim = layer_dim
         self.hidden_dim = hidden_dim
         self.neural_dim = neural_dim
@@ -33,22 +69,42 @@ class GRUDecoder(nn.Module):
         self.kernelLen = kernelLen
         self.gaussianSmoothWidth = gaussianSmoothWidth
         self.bidirectional = bidirectional
-        self.inputLayerNonlinearity = torch.nn.Softsign()
-        self.unfolder = torch.nn.Unfold(
-            (self.kernelLen, 1), dilation=1, padding=0, stride=self.strideLen
-        )
+
+        # ---------- preprocessing layers ----------
+        self.inputLayerNonlinearity = nn.Softsign()
         self.gaussianSmoother = GaussianSmoothing(
             neural_dim, 20, self.gaussianSmoothWidth, dim=1
         )
-        self.dayWeights = torch.nn.Parameter(torch.randn(nDays, neural_dim, neural_dim))
-        self.dayBias = torch.nn.Parameter(torch.zeros(nDays, 1, neural_dim))
+
+        # Day transforms
+        self.dayWeights = nn.Parameter(torch.randn(nDays, neural_dim, neural_dim))
+        self.dayBias = nn.Parameter(torch.zeros(nDays, 1, neural_dim))
 
         for x in range(nDays):
-            self.dayWeights.data[x, :, :] = torch.eye(neural_dim)
+            self.dayWeights.data[x] = torch.eye(neural_dim)
 
-        # GRU layers
+        # Per-day input layers
+        for x in range(nDays):
+            setattr(self, f"inpLayer{x}", nn.Linear(neural_dim, neural_dim))
+            layer = getattr(self, f"inpLayer{x}")
+            layer.weight = nn.Parameter(layer.weight + torch.eye(neural_dim))
+
+        # ---------- NEW: TCN FRONT-END ----------
+        self.tcn = nn.Sequential(
+            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=1, dropout=0.2),
+            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=2, dropout=0.2),
+            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=4, dropout=0.2),
+            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=8, dropout=0.2), # addition for 2.3, also reduce all dropouts
+        )
+
+        # ---------- kernel/stride unfolding ----------
+        self.unfolder = nn.Unfold(
+            (self.kernelLen, 1), stride=self.strideLen
+        )
+
+        # ---------- GRU ----------
         self.gru_decoder = nn.GRU(
-            (neural_dim) * self.kernelLen,
+            neural_dim * self.kernelLen,
             hidden_dim,
             layer_dim,
             batch_first=True,
@@ -62,62 +118,39 @@ class GRUDecoder(nn.Module):
             if "weight_ih" in name:
                 nn.init.xavier_uniform_(param)
 
-        # Input layers
-        for x in range(nDays):
-            setattr(self, "inpLayer" + str(x), nn.Linear(neural_dim, neural_dim))
+        # ---------- output head ----------
+        out_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.fc_decoder_out = nn.Linear(out_dim, n_classes + 1)
 
-        for x in range(nDays):
-            thisLayer = getattr(self, "inpLayer" + str(x))
-            thisLayer.weight = torch.nn.Parameter(
-                thisLayer.weight + torch.eye(neural_dim)
-            )
-
-        # rnn outputs
-        if self.bidirectional:
-            self.fc_decoder_out = nn.Linear(
-                hidden_dim * 2, n_classes + 1
-            )  # +1 for CTC blank
-        else:
-            self.fc_decoder_out = nn.Linear(hidden_dim, n_classes + 1)  # +1 for CTC blank
-
+    # -------------------------------------------------------
+    # Forward
+    # -------------------------------------------------------
     def forward(self, neuralInput, dayIdx):
-        neuralInput = torch.permute(neuralInput, (0, 2, 1))
+        # (B, T, C)
+        neuralInput = neuralInput.transpose(1, 2)   # → (B, C, T)
         neuralInput = self.gaussianSmoother(neuralInput)
-        neuralInput = torch.permute(neuralInput, (0, 2, 1))
+        neuralInput = neuralInput.transpose(1, 2)   # → (B, T, C)
 
-        # apply day layer
-        dayWeights = torch.index_select(self.dayWeights, 0, dayIdx)
-        transformedNeural = torch.einsum(
-            "btd,bdk->btk", neuralInput, dayWeights
-        ) + torch.index_select(self.dayBias, 0, dayIdx)
-        transformedNeural = self.inputLayerNonlinearity(transformedNeural)
+        # Day transform
+        W = torch.index_select(self.dayWeights, 0, dayIdx)
+        B = torch.index_select(self.dayBias, 0, dayIdx)
+        x = torch.einsum("btd,bdk->btk", neuralInput, W) + B
+        x = self.inputLayerNonlinearity(x)
 
-        # stride/kernel
-        stridedInputs = torch.permute(
-            self.unfolder(
-                torch.unsqueeze(torch.permute(transformedNeural, (0, 2, 1)), 3)
-            ),
-            (0, 2, 1),
-        )
+        # ----- NEW: TCN -----
+        x = x.transpose(1, 2)   # → (B, C, T)
+        x = self.tcn(x)
+        x = x.transpose(1, 2)   # → (B, T, C)
 
-        # apply RNN layer
-        if self.bidirectional:
-            h0 = torch.zeros(
-                self.layer_dim * 2,
-                transformedNeural.size(0),
-                self.hidden_dim,
-                device=self.device,
-            ).requires_grad_()
-        else:
-            h0 = torch.zeros(
-                self.layer_dim,
-                transformedNeural.size(0),
-                self.hidden_dim,
-                device=self.device,
-            ).requires_grad_()
+        # Stride/kernel unfolding
+        x = self.unfolder(
+            x.transpose(1, 2).unsqueeze(3)
+        ).transpose(1, 2)
 
-        hid, _ = self.gru_decoder(stridedInputs, h0.detach())
+        # GRU
+        num_layers = self.layer_dim * (2 if self.bidirectional else 1)
+        h0 = torch.zeros(num_layers, x.size(0), self.hidden_dim, device=self.device)
+        hid, _ = self.gru_decoder(x, h0)
 
-        # get seq
-        seq_out = self.fc_decoder_out(hid)
-        return seq_out
+        # Linear head
+        return self.fc_decoder_out(hid)
