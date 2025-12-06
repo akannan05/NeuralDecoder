@@ -1,11 +1,8 @@
 import torch
 from torch import nn
 from .augmentations import GaussianSmoothing
+from .augmentations import RandomMasking
 
-
-# -------------------------------------------------------
-# Minimal TCN Residual Block (light, safe for GPU)
-# -------------------------------------------------------
 class TemporalBlock(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size=5, dilation=1, dropout=0.0):
         super().__init__()
@@ -36,11 +33,7 @@ class TemporalBlock(nn.Module):
         out = self.dropout(out)
 
         return out + self.residual(x)
-
-
-# -------------------------------------------------------
-# GRU + TCN Hybrid Decoder
-# -------------------------------------------------------
+        
 class GRUDecoder(nn.Module):
     def __init__(
         self,
@@ -76,33 +69,34 @@ class GRUDecoder(nn.Module):
             neural_dim, 20, self.gaussianSmoothWidth, dim=1
         )
 
-        # Day transforms
+        self.randomMask = RandomMasking(
+            time_mask_prob=0.15,
+            feature_mask_prob=0.15,
+            max_time_mask=100,
+            max_feature_mask=50,
+        )
+
         self.dayWeights = nn.Parameter(torch.randn(nDays, neural_dim, neural_dim))
         self.dayBias = nn.Parameter(torch.zeros(nDays, 1, neural_dim))
 
         for x in range(nDays):
             self.dayWeights.data[x] = torch.eye(neural_dim)
 
-        # Per-day input layers
         for x in range(nDays):
             setattr(self, f"inpLayer{x}", nn.Linear(neural_dim, neural_dim))
             layer = getattr(self, f"inpLayer{x}")
             layer.weight = nn.Parameter(layer.weight + torch.eye(neural_dim))
 
-        # ---------- NEW: TCN FRONT-END ----------
         self.tcn = nn.Sequential(
-            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=1, dropout=0.2),
-            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=2, dropout=0.2),
-            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=4, dropout=0.2),
-            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=8, dropout=0.2), # addition for 2.3, also reduce all dropouts
+            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=1, dropout=dropout),
+            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=2, dropout=dropout),
+            TemporalBlock(neural_dim, neural_dim, kernel_size=5, dilation=4, dropout=dropout),
         )
 
-        # ---------- kernel/stride unfolding ----------
         self.unfolder = nn.Unfold(
             (self.kernelLen, 1), stride=self.strideLen
         )
 
-        # ---------- GRU ----------
         self.gru_decoder = nn.GRU(
             neural_dim * self.kernelLen,
             hidden_dim,
@@ -118,13 +112,9 @@ class GRUDecoder(nn.Module):
             if "weight_ih" in name:
                 nn.init.xavier_uniform_(param)
 
-        # ---------- output head ----------
         out_dim = hidden_dim * 2 if bidirectional else hidden_dim
         self.fc_decoder_out = nn.Linear(out_dim, n_classes + 1)
 
-    # -------------------------------------------------------
-    # Forward
-    # -------------------------------------------------------
     def forward(self, neuralInput, dayIdx):
         # (B, T, C)
         neuralInput = neuralInput.transpose(1, 2)   # → (B, C, T)
@@ -137,10 +127,11 @@ class GRUDecoder(nn.Module):
         x = torch.einsum("btd,bdk->btk", neuralInput, W) + B
         x = self.inputLayerNonlinearity(x)
 
-        # ----- NEW: TCN -----
         x = x.transpose(1, 2)   # → (B, C, T)
         x = self.tcn(x)
         x = x.transpose(1, 2)   # → (B, T, C)
+
+        x = self.randomMask(x)  # still (B, T, C); no-op in eval mode
 
         # Stride/kernel unfolding
         x = self.unfolder(
