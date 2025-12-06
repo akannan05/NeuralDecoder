@@ -3,7 +3,7 @@ import numbers
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+import numpy as np
 
 class WhiteNoise(nn.Module):
     def __init__(self, std=0.1):
@@ -23,6 +23,51 @@ class MeanDriftNoise(nn.Module):
         _, C = x.shape
         noise = torch.randn(1, C) * self.std
         return x + noise
+
+#Random Masking
+class RandomMasking(nn.Module):
+    def __init__(self, time_mask_prob=0.15, feature_mask_prob=0.15, 
+                 max_time_mask=100, max_feature_mask=50):
+        super().__init__()
+
+        self.time_mask_prob = time_mask_prob
+        self.feature_mask_prob = feature_mask_prob
+        self.max_time_mask = max_time_mask
+        self.max_feature_mask = max_feature_mask
+
+    def forward(self, x):
+        # x: (B, T, D)
+        if not self.training:
+            return x
+
+        B, T, D = x.shape
+        device = x.device
+
+        # ----- Time Mask -----
+        if torch.rand(1, device=device).item() < self.time_mask_prob:
+            # mask length
+            mask_len = torch.randint(
+                1, self.max_time_mask + 1, (1,), device=device
+            ).item()
+            # start index
+            mask_start = torch.randint(
+                0, max(1, T - mask_len + 1), (1,), device=device
+            ).item()
+
+            x[:, mask_start:mask_start + mask_len, :] = 0
+
+        # ----- Feature Mask -----
+        if torch.rand(1, device=device).item() < self.feature_mask_prob:
+            mask_len = torch.randint(
+                1, self.max_feature_mask + 1, (1,), device=device
+            ).item()
+            mask_start = torch.randint(
+                0, max(1, D - mask_len + 1), (1,), device=device
+            ).item()
+
+            x[:, :, mask_start:mask_start + mask_len] = 0
+
+        return x
 
 class GaussianSmoothing(nn.Module):
     """
